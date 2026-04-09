@@ -2,3 +2,4 @@
 /.direnv
 .Rprofile
 .envrc
+.DS_Store
