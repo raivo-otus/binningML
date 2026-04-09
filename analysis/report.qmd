@@ -39,11 +39,18 @@ tar_load(model_results)
 
 # Order transformations so binning sits next to the others for easy comparison
 trans_levels <- c("relabundance", "rclr", "pa", "binning")
+metric_cols  <- c("Accuracy", "Kappa")
+
 results <- model_results |>
   mutate(
     transformation = factor(transformation, levels = trans_levels),
     is_binning     = transformation == "binning"
   )
+
+results_long <- results |>
+  select(dataset, method, transformation, is_binning, all_of(metric_cols)) |>
+  pivot_longer(all_of(metric_cols), names_to = "metric", values_to = "value") |>
+  mutate(metric = factor(metric, levels = metric_cols))
 ```
 
 # At-a-glance: does binning help?
@@ -53,21 +60,23 @@ transformation deliver competitive test-set AUC compared to the standard
 transformations (relabundance, rCLR, presence/absence)?** Each panel slices
 the same `model_results` table from a different angle.
 
-## Test AUC by transformation, per classifier
+## Classification metrics by transformation, per classifier
 
 Each point is one dataset. Boxplots summarise the spread across datasets.
-If binning works, its box should sit at or above the others.
+If binning works, its box should sit at or above the others on every metric.
 
-```{r fig-box-auc, fig.height=5}
-ggplot(results, aes(x = transformation, y = Accuracy, fill = is_binning)) +
+```{r fig-box-metrics, fig.height=8}
+ggplot(results_long,
+       aes(x = transformation, y = value, fill = is_binning)) +
   geom_boxplot(outlier.shape = NA, alpha = 0.6) +
-  geom_jitter(width = 0.15, height = 0, size = 1.5, alpha = 0.7) +
-  facet_wrap(~ method) +
+  geom_jitter(width = 0.15, height = 0, size = 1.2, alpha = 0.7) +
+  facet_grid(metric ~ method, scales = "free_y") +
   scale_fill_manual(values = c(`FALSE` = "grey70", `TRUE` = "#D7263D"),
                     guide = "none") +
-  labs(x = NULL, y = "Accuracy",
-       title = "Test Accuracy across datasets, by transformation and classifier") +
-  theme_minimal(base_size = 12)
+  labs(x = NULL, y = "Metric value",
+       title = "Accuracy and Kappa across datasets") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
 ```
 
 ## Per-dataset comparison: binning vs. best alternative
@@ -143,16 +152,11 @@ results |>
 ## Summary table
 
 ```{r tbl-summary}
-results |>
-  group_by(method, transformation) |>
-  summarise(
-    n_datasets = n(),
-    mean_auc   = mean(Accuracy, na.rm = TRUE),
-    median_auc = median(Accuracy, na.rm = TRUE),
-    sd_auc     = sd(Accuracy, na.rm = TRUE),
-    .groups    = "drop"
-  ) |>
-  arrange(method, desc(mean_auc)) |>
+results_long |>
+  group_by(method, transformation, metric) |>
+  summarise(mean_value = mean(value, na.rm = TRUE), .groups = "drop") |>
+  pivot_wider(names_from = metric, values_from = mean_value) |>
+  arrange(method, desc(Accuracy)) |>
   knitr::kable(digits = 3)
 ```
 
