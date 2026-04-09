@@ -10,12 +10,18 @@ rix(
     "ggsci",
     "mia",
     "miaViz",
+    "targets",
+    "tarchetypes",
+    "mikropml",
+    "ranger",
     "patchwork",
     "quarto",
     "rix",
     "scater",
     "stringr",
     "tidyr",
+    "purrr",
+    "crew",
     "usethis"
   ),
   system_pkgs = c(

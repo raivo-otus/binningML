@@ -1,0 +1,35 @@
+---
+title: "Quantile Binning for Microbiome ML"
+subtitle: "EuroBioC2026 — Results Report"
+author:
+  - name: "Rasmus Hindström"
+    affiliation: "Department of Computing, University of Turku"
+    email: "rasmus.hindstrom@utu.fi"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    number-sections: true
+    theme: flatly
+    embed-resources: true   # single self-contained HTML
+    code-fold: true
+    code-tools: true
+    fig-width: 8
+    fig-height: 5
+    fig-dpi: 150
+execute:
+  echo: false
+  warning: false
+  message: false
+  cache: false              # targets handles caching — never cache in Quarto
+params:
+  store: "../_targets"      # path to targets store, relative to this .qmd
+---
+
+```{r}
+library(targets)
+
+tar_load(tse_list)
+```
