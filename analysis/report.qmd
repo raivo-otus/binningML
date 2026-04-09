@@ -28,8 +28,131 @@ params:
   store: "../_targets"      # path to targets store, relative to this .qmd
 ---
 
-```{r}
+```{r setup}
 library(targets)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggsci)
 
-tar_load(tse_list)
+tar_load(model_results)
+
+# Order transformations so binning sits next to the others for easy comparison
+trans_levels <- c("relabundance", "rclr", "pa", "binning")
+results <- model_results |>
+  mutate(
+    transformation = factor(transformation, levels = trans_levels),
+    is_binning     = transformation == "binning"
+  )
 ```
+
+# At-a-glance: does binning help?
+
+The plots below are designed to answer one question: **does the binning
+transformation deliver competitive test-set AUC compared to the standard
+transformations (relabundance, rCLR, presence/absence)?** Each panel slices
+the same `model_results` table from a different angle.
+
+## Test AUC by transformation, per classifier
+
+Each point is one dataset. Boxplots summarise the spread across datasets.
+If binning works, its box should sit at or above the others.
+
+```{r fig-box-auc, fig.height=5}
+ggplot(results, aes(x = transformation, y = Accuracy, fill = is_binning)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.6) +
+  geom_jitter(width = 0.15, height = 0, size = 1.5, alpha = 0.7) +
+  facet_wrap(~ method) +
+  scale_fill_manual(values = c(`FALSE` = "grey70", `TRUE` = "#D7263D"),
+                    guide = "none") +
+  labs(x = NULL, y = "Accuracy",
+       title = "Test Accuracy across datasets, by transformation and classifier") +
+  theme_minimal(base_size = 12)
+```
+
+## Per-dataset comparison: binning vs. best alternative
+
+For each dataset × classifier, we compute the gap between binning's AUC and
+the best non-binning transformation. Positive bars mean binning *wins* on
+that dataset; negative bars mean a standard transformation does better.
+
+```{r fig-delta-auc, fig.height=6}
+delta <- results |>
+  select(dataset, method, transformation, Accuracy) |>
+  pivot_wider(names_from = transformation, values_from = Accuracy) |>
+  mutate(
+    best_other = pmax(relabundance, rclr, pa, na.rm = TRUE),
+    delta_auc  = binning - best_other
+  )
+
+ggplot(delta, aes(x = reorder(dataset, delta_auc), y = delta_auc,
+                  fill = delta_auc > 0)) +
+  geom_col() +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  coord_flip() +
+  facet_wrap(~ method) +
+  scale_fill_manual(values = c(`FALSE` = "grey60", `TRUE` = "#2E86AB"),
+                    guide = "none") +
+  labs(x = NULL, y = "Accuracy(binning) − Accuracy(best other)",
+       title = "Where does binning beat the best alternative?") +
+  theme_minimal(base_size = 12)
+```
+
+## Head-to-head scatter
+
+Binning vs. each alternative, point-by-point. Points above the diagonal
+mean binning wins on that (dataset, classifier) pair.
+
+```{r fig-scatter, fig.height=5}
+scatter <- results |>
+  select(dataset, method, transformation, Accuracy) |>
+  pivot_wider(names_from = transformation, values_from = Accuracy) |>
+  pivot_longer(c(relabundance, rclr, pa),
+               names_to = "alternative", values_to = "alt_auc")
+
+ggplot(scatter, aes(x = alt_auc, y = binning, colour = method)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              colour = "grey50") +
+  geom_point(size = 2, alpha = 0.8) +
+  facet_wrap(~ alternative) +
+  scale_color_jco() +
+  coord_equal() +
+  labs(x = "CV Accuracy (alternative transformation)",
+       y = "CV Accuracy (binning)",
+       title = "Binning vs. alternatives — points above the line favour binning") +
+  theme_minimal(base_size = 12)
+```
+
+## Selected `n_bins` distribution
+
+Which bin counts did the inner CV pick? A tight distribution suggests a
+sweet spot; a flat one suggests `n_bins` doesn't matter much.
+
+```{r fig-nbins, fig.height=4}
+results |>
+  filter(transformation == "binning") |>
+  ggplot(aes(x = factor(selected_n_bins), fill = method)) +
+  geom_bar(position = "dodge") +
+  scale_fill_jco() +
+  labs(x = "Selected n_bins (inner-CV winner)",
+       y = "Number of datasets",
+       title = "Tuned n_bins across datasets") +
+  theme_minimal(base_size = 12)
+```
+
+## Summary table
+
+```{r tbl-summary}
+results |>
+  group_by(method, transformation) |>
+  summarise(
+    n_datasets = n(),
+    mean_auc   = mean(Accuracy, na.rm = TRUE),
+    median_auc = median(Accuracy, na.rm = TRUE),
+    sd_auc     = sd(Accuracy, na.rm = TRUE),
+    .groups    = "drop"
+  ) |>
+  arrange(method, desc(mean_auc)) |>
+  knitr::kable(digits = 3)
+```
+

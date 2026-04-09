@@ -19,13 +19,13 @@ tar_option_set(
     "tidyr"
   ),
   format = "rds",
-  controller = crew_controller_local(workers = 4)
+  # controller = crew_controller_local(workers = 4) # disable parallel for now
 )
 
 # Global parameters — tweak here, everything downstream updates
 params <- list(
-  min_class_n  = 30L, # Minimum samples per class for a dataset to be included
-  n_bins_grid  = c(3, 4, 5, 7, 10, 15, 20), # Bin count search grid
+  min_class_n  = 40L, # Minimum samples per class for a dataset to be included
+  n_bins_grid  = c(5, 8, 13, 21, 34), # Bin count search grid
   cv_folds     = 5L, # Folds for both outer and inner CV loops
   random_seed  = 42L
 )
@@ -38,14 +38,42 @@ list(
   tar_target(random_seed, params$random_seed),
 
   # ── Data –––––––––––––––––––––––––─────────────────────────────────────────
-  tar_target(data_file, "data/tses_85_280126.rds", format = "file"),
+  tar_target(data_file, "data/tses_85_280126.Rdata", format = "file"),
   tar_target(tse_list_raw, load_tse_list(data_file)),
   tar_target(tse_list, filter_tse_list(tse_list_raw, min_class_n)),
 
-  # ── Transformations (Step 3 — dynamic branching placeholder) ──────────────
-  # tar_target(transformation_names, c("binning", "rclr", "relabundance", "pa")),
+  # ── Transformations ───────────────────────────────────────────────────────
+  # One list of TSEs; each TSE gains assays: relabundance, rclr, pa.
+  tar_target(tse_list_transformed, add_all_transformations(tse_list)),
 
-  # ── Modeling (Steps 4–5 — wired in later) ─────────────────────────────────
+  # ── Modeling ──────────────────────────────────────────────────────────────
+  # Dynamic branching over the (dataset, transformation) grid. Each branch
+  # runs mikropml::run_ml; the binning branch additionally tunes n_bins.
+  tar_target(transformation_names,
+             c("relabundance", "rclr", "pa", "binning")),
+  tar_target(classifier_names, c("rf", "glmnet")),
+  tar_target(
+    model_grid,
+    tidyr::expand_grid(
+      dataset_name   = names(tse_list_transformed),
+      transformation = transformation_names,
+      classifier     = classifier_names
+    )
+  ),
+  tar_target(
+    model_results,
+    evaluate_transformation(
+      tse            = tse_list_transformed[[model_grid$dataset_name]],
+      transformation = model_grid$transformation,
+      method         = model_grid$classifier,
+      n_bins_grid    = n_bins_grid,
+      kfold          = cv_folds,
+      seed           = random_seed
+    ) |>
+      dplyr::mutate(dataset = model_grid$dataset_name, .before = 1),
+    pattern = map(model_grid)
+  ),
+
 
   # ── Reporting ─────────────────────────────────────────────────────────────
   tar_quarto(
