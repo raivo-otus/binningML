@@ -1,5 +1,5 @@
-/data
-/.direnv
+data/
+.direnv/
 .Rprofile
 .envrc
 .DS_Store
