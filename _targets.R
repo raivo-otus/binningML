@@ -51,7 +51,7 @@ list(
   # runs mikropml::run_ml; the binning branch additionally tunes n_bins.
   tar_target(transformation_names,
              c("relabundance", "rclr", "pa", "binning")),
-  tar_target(classifier_names, c("rf", "rpart2", "svmRadial")),
+  tar_target(classifier_names, c("rf", "rpart2", "svmRadial", "glmnet", "xgbTree")),
   tar_target(
     model_grid,
     tidyr::expand_grid(
