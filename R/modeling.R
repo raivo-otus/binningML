@@ -39,8 +39,9 @@ run_ml_on_assay <- function(tse,
                             kfold = 5L,
                             seed = 42L) {
   df <- tse_to_ml_df(tse, assay_name = assay_name, label_col = label_col)
+  preprocessed <- mikropml::preprocess_data(df, outcome_colname = "outcome")
   mikropml::run_ml(
-    dataset         = df,
+    dataset         = preprocessed$dat_transformed,
     method          = method,
     outcome_colname = "outcome",
     kfold           = kfold,

@@ -25,7 +25,7 @@ tar_option_set(
 # Global parameters — tweak here, everything downstream updates
 params <- list(
   min_class_n  = 50L, # Minimum samples per class for a dataset to be included
-  n_bins_grid  = c(1, 2, 3, 5, 8, 13, 21, 34, 55), # Bin count search grid
+  n_bins_grid  = c(2, 3, 5, 8, 13, 21, 34, 55), # Bin count search grid
   cv_folds     = 5L, # Folds for both outer and inner CV loops
   random_seed  = 42L
 )
@@ -51,7 +51,7 @@ list(
   # runs mikropml::run_ml; the binning branch additionally tunes n_bins.
   tar_target(transformation_names,
              c("relabundance", "rclr", "pa", "binning")),
-  tar_target(classifier_names, c("rf", "rpart2", "svmRadial", "glmnet", "xgbTree")),
+  tar_target(classifier_names, c("rf", "glmnet")),
   tar_target(
     model_grid,
     tidyr::expand_grid(
