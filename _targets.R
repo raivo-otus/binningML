@@ -24,7 +24,7 @@ tar_option_set(
 
 # Global parameters — tweak here, everything downstream updates
 params <- list(
-  min_class_n  = 50L, # Minimum samples per class for a dataset to be included
+  min_class_n  = 40L, # Minimum samples per class for a dataset to be included
   n_bins_grid  = c(2, 3, 5, 8, 13, 21, 34, 55), # Bin count search grid
   cv_folds     = 5L, # Folds for both outer and inner CV loops
   random_seed  = 42L

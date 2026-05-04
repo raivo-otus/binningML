@@ -36,6 +36,18 @@ library(ggplot2)
 library(ggsci)
 
 tar_load(model_results)
+tar_load(tse_list_transformed)
+
+dataset_meta <- purrr::imap_dfr(tse_list_transformed, function(tse, nm) {
+  counts_mat <- SummarizedExperiment::assay(tse, "counts")
+  cd         <- as.data.frame(SummarizedExperiment::colData(tse))
+  tibble::tibble(
+    dataset  = nm,
+    sparsity = mean(counts_mat == 0),
+    seq_type = unique(cd$seq_type)[[1]],
+    disease  = unique(cd$disease)[[1]]
+  )
+})
 
 # Order transformations so binning sits next to the others for easy comparison
 trans_levels <- c("relabundance", "rclr", "pa", "binning")
@@ -71,8 +83,7 @@ ggplot(results_long,
   geom_boxplot(outlier.shape = NA, alpha = 0.6) +
   geom_jitter(width = 0.15, height = 0, size = 1.2, alpha = 0.7) +
   facet_grid(metric ~ method, scales = "free_y") +
-  scale_fill_manual(values = c(`FALSE` = "grey70", `TRUE` = "#D7263D"),
-                    guide = "none") +
+  scale_fill_npg(guide = "none") +
   labs(x = NULL, y = "Metric value",
        title = "Accuracy and Kappa across datasets") +
   theme_minimal(base_size = 12) +
@@ -100,8 +111,7 @@ ggplot(delta, aes(x = reorder(dataset, delta_auc), y = delta_auc,
   geom_hline(yintercept = 0, linewidth = 0.3) +
   coord_flip() +
   facet_wrap(~ method) +
-  scale_fill_manual(values = c(`FALSE` = "grey60", `TRUE` = "#2E86AB"),
-                    guide = "none") +
+  scale_fill_npg(guide = "none") +
   labs(x = NULL, y = "Accuracy(binning) − Accuracy(best other)",
        title = "Where does binning beat the best alternative?") +
   theme_minimal(base_size = 12)
@@ -124,7 +134,7 @@ ggplot(scatter, aes(x = alt_auc, y = binning, colour = method)) +
               colour = "grey50") +
   geom_point(size = 2, alpha = 0.8) +
   facet_wrap(~ alternative) +
-  scale_color_jco() +
+  scale_color_npg() +
   coord_equal() +
   labs(x = "CV Accuracy (alternative transformation)",
        y = "CV Accuracy (binning)",
@@ -142,11 +152,138 @@ results |>
   filter(transformation == "binning") |>
   ggplot(aes(x = factor(selected_n_bins), fill = method)) +
   geom_bar(position = "dodge") +
-  scale_fill_jco() +
+  scale_fill_npg() +
   labs(x = "Selected n_bins (inner-CV winner)",
        y = "Number of datasets",
        title = "Tuned n_bins across datasets") +
   theme_minimal(base_size = 12)
+```
+
+## Sparsity and binning advantage
+
+Does binning's edge grow with data sparsity? Each point is one dataset;
+delta is the difference between binning accuracy and the best standard
+transformation, averaged across the two classifiers.
+
+```{r fig-sparsity-delta, fig.height=5}
+sparsity_delta <- results |>
+  select(dataset, method, transformation, Accuracy) |>
+  mutate(transformation = as.character(transformation)) |>
+  pivot_wider(names_from = transformation, values_from = Accuracy) |>
+  mutate(
+    best_other = pmax(relabundance, rclr, pa, na.rm = TRUE),
+    delta_acc  = binning - best_other
+  ) |>
+  left_join(dataset_meta, by = "dataset")
+
+label_pts <- sparsity_delta |>
+  group_by(method) |>
+  slice_max(delta_acc, n = 3) |>
+  ungroup()
+
+ggplot(sparsity_delta, aes(x = sparsity, y = delta_acc, colour = seq_type)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey60",
+             linewidth = 0.4) +
+  geom_smooth(aes(group = 1), method = "lm", se = TRUE,
+              colour = "grey35", fill = "grey80", linewidth = 0.7) +
+  geom_point(size = 2.5, alpha = 0.85) +
+  geom_text(data = label_pts,
+            aes(label = disease),
+            size = 2.8, nudge_y = 0.007, hjust = 0.5,
+            show.legend = FALSE) +
+  facet_wrap(~ method) +
+  scale_colour_npg() +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(x = "Count-matrix sparsity (post-agglomeration)",
+       y = "Δ Accuracy (binning − best standard)",
+       colour = "Seq. type",
+       title = "Binning gains most in high-sparsity datasets") +
+  theme_minimal(base_size = 12)
+```
+
+## Statistical comparison across transformations
+
+Friedman test (non-parametric repeated-measures) treats each dataset as a
+block and tests whether any transformation ranks consistently higher.
+Pairwise Wilcoxon signed-rank tests (Holm-adjusted) follow up on the
+omnibus result. Each cell shows the significance level and the mean accuracy
+difference (row − column); red cells favour the row transformation, blue
+cells favour the column transformation.
+
+```{r stat-tests}
+trans_order <- c("relabundance", "rclr", "pa", "binning")
+pairs       <- combn(trans_order, 2, simplify = FALSE)
+
+test_wide <- model_results |>
+  select(dataset, method, transformation, Accuracy) |>
+  pivot_wider(names_from = transformation, values_from = Accuracy)
+
+# Friedman test per method
+friedman_tbl <- model_results |>
+  select(dataset, method, transformation, Accuracy) |>
+  group_by(method) |>
+  group_modify(~ {
+    ft <- friedman.test(Accuracy ~ transformation | dataset, data = .x)
+    tibble::tibble(chi_sq  = round(ft$statistic, 2),
+                   df      = ft$parameter,
+                   p_value = ft$p.value)
+  }) |>
+  ungroup()
+
+# Pairwise Wilcoxon (Holm-adjusted within each method)
+pw_results <- test_wide |>
+  group_by(method) |>
+  group_modify(~ {
+    purrr::map_dfr(pairs, function(p) {
+      wt <- wilcox.test(.x[[p[1]]], .x[[p[2]]], paired = TRUE, exact = FALSE)
+      tibble::tibble(trans1    = p[1],
+                     trans2    = p[2],
+                     mean_diff = mean(.x[[p[2]]] - .x[[p[1]]], na.rm = TRUE),
+                     p_raw     = wt$p.value)
+    }) |>
+      mutate(p_adj = p.adjust(p_raw, method = "holm"))
+  }) |>
+  ungroup()
+```
+
+```{r tbl-friedman}
+friedman_tbl |>
+  knitr::kable(digits = c(0, 2, 0, 4),
+               col.names = c("Method", "χ²", "df", "p-value"),
+               caption   = "Friedman test: are transformation ranks non-random?")
+```
+
+```{r fig-pw-wilcox, fig.height=5}
+pw_sym <- pw_results |>
+  bind_rows(
+    rename(pw_results, trans1 = trans2, trans2 = trans1) |>
+      mutate(mean_diff = -mean_diff)
+  ) |>
+  mutate(
+    sig    = cut(p_adj,
+                 breaks = c(0, 0.001, 0.01, 0.05, 1),
+                 labels = c("***", "**", "*", "ns"),
+                 right  = TRUE),
+    trans1 = factor(trans1, levels = trans_order),
+    trans2 = factor(trans2, levels = rev(trans_order)),
+    label  = paste0(as.character(sig), "\n", sprintf("%+.3f", mean_diff))
+  )
+
+ggplot(pw_sym, aes(x = trans1, y = trans2, fill = mean_diff)) +
+  geom_tile(colour = "white", linewidth = 0.6) +
+  geom_text(aes(label = label), size = 3, lineheight = 0.9) +
+  facet_wrap(~ method) +
+  scale_fill_gradient2(low  = "#4DBBD5FF",
+                       mid  = "white",
+                       high = "#E64B35FF",
+                       midpoint = 0,
+                       name = "Mean Δ Acc\n(row − col)") +
+  labs(x = NULL, y = NULL,
+       title   = "Pairwise Wilcoxon signed-rank tests (Holm-adjusted)",
+       caption = "Δ Acc = row transformation − column transformation") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1),
+        panel.grid  = element_blank())
 ```
 
 ## Summary table
