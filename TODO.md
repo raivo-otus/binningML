@@ -1,4 +1,4 @@
-# Migration: mikropml → caret + fix data leakage
+# Migration: mikropml → tidymodels + fix data leakage
 
 ## Problem
 
@@ -16,36 +16,45 @@ In `run_ml_on_assay()` ([R/modeling.R:42](R/modeling.R#L42)), `preprocess_data(d
 
 ## Proposed Fix
 
-Replace mikropml with caret and implement a proper two-level CV structure:
+Replace mikropml with tidymodels (rsample / recipes / parsnip / workflows /
+tune / yardstick) and implement a proper two-level CV structure. Preprocessing
+is encoded as a `recipe` so prep/bake happen automatically per resample —
+preventing leakage by construction.
+
+For binning, we add a custom recipe step `step_quantile_bin()` that wraps the
+Phase 1 utilities: `prep()` calls `fit_bin_breaks()` on the resample's analysis
+set; `bake()` calls `apply_bin_breaks()`. `n_bins` is exposed as a tunable
+parameter so `tune::tune_grid()` handles inner CV automatically.
 
 ```
-Outer split (fixed seed, stratified 80/20)
-  └── Training set
-        ├── Inner k-fold CV (n_bins tuning)
-        │     For each fold:
-        │       fit_bin_breaks()  ← on inner-train samples only
-        │       apply to inner-val
-        │       fit classifier (caret::train)
-        │       record val AUC per n_bins candidate
-        │     best_n_bins = argmax(mean val AUC across folds)
+rsample::initial_split(strata = outcome, prop = 0.8)   ← fixed seed
+  └── training()
+        ├── rsample::vfold_cv(strata, v = kfold)       ← inner CV
+        │     workflow = recipe + model spec
+        │       recipe: step_quantile_bin(n_bins = tune())
+        │               step_nzv() → step_normalize()
+        │       spec:   rand_forest / logistic_reg
+        │     tune::tune_grid(workflow, resamples, grid = n_bins_grid,
+        │                     metrics = metric_set(roc_auc, accuracy, kap))
+        │     ← prep/bake fitted per fold on analysis() only
         │
-        └── Final refit on full training set with best_n_bins
-              fit_bin_breaks()  ← on full training set only
-              apply to test set using those breaks
-              fit caret model
-              evaluate on test set → report Accuracy, Kappa, AUC
+        └── tune::select_best(metric = "roc_auc")
+              tune::finalize_workflow(best_params)
+              tune::last_fit(split)                    ← refit on training(),
+                                                        evaluate on testing()
+              yardstick metrics: accuracy, kap, roc_auc
 ```
 
-For the non-binning transformations (relabundance, rclr, pa), which are already
-pre-computed on the full dataset but are sample-wise transforms with no
-cross-sample statistics, the simplified fix is:
+For the non-binning transformations (relabundance, rclr, pa) — already
+pre-computed on the full TSE but sample-wise with no cross-sample statistics —
+the recipe drops `step_quantile_bin()` and keeps only `step_nzv()` +
+`step_normalize()`:
 
 ```
-Outer split (same fixed seed)
-  Training set → preProcess(method = c("nzv", "center", "scale"))  ← fit here
-  Apply preProcess to test set
-  caret::train() with inner CV for classifier hyperparams
-  Evaluate on test set
+rsample::initial_split(strata, prop = 0.8)             ← same seed
+  workflow = recipe(step_nzv → step_normalize) + spec
+  tune::tune_grid() over classifier hyperparameters    ← rsample::vfold_cv
+  tune::last_fit() on the outer split
 ```
 
 ---
@@ -68,56 +77,74 @@ Outer split (same fixed seed)
 - [ ] Remove or deprecate `transform_binning()` — it will no longer be called from
   the modeling path (but keep it if mia-based binning is still used elsewhere)
 
-### Phase 2 — Replace mikropml modeling with caret (R/modeling.R)
+### Phase 2 — Replace mikropml modeling with tidymodels (R/modeling.R)
 
 - [ ] Remove `mikropml` from `tar_option_set(packages = ...)` in `_targets.R`; add
-  `caret`, `pROC`, and the backend packages (`ranger`, `glmnet` already present)
+  `tidymodels` (or the constituent packages: `rsample`, `recipes`, `parsnip`,
+  `workflows`, `tune`, `yardstick`, `dials`). Backends `ranger` and `glmnet`
+  are already present.
 
-- [ ] Add helper `make_train_control(kfold)` returning a `caret::trainControl` with:
-  - `method = "cv"`, `number = kfold`
-  - `classProbs = TRUE`, `summaryFunction = twoClassSummary`
-  - `savePredictions = "final"`
+- [ ] Add a custom recipe step `step_quantile_bin()` (R/recipe_steps.R):
+  - Constructor stores `n_bins` (tunable via `dials::new_quant_param()`) and
+    selected columns
+  - `prep.step_quantile_bin()`: pull analysis-set predictors as a features ×
+    samples matrix, call `fit_bin_breaks(mat, n_bins)`, store the breaks list
+    on the step
+  - `bake.step_quantile_bin()`: apply `apply_bin_breaks()` using the stored
+    breaks; replace the columns in the baked tibble
+  - Register a tunable parameter `n_bins()` so `tune::tune_grid()` recognises it
+  - This wraps the Phase 1 utilities — no new binning math here.
 
-- [ ] Add helper `caret_method_name(method)` mapping `"rf"` → `"ranger"` and
-  `"glmnet"` → `"glmnet"` (caret method strings)
+- [ ] Add helper `model_spec(method)` returning a parsnip spec:
+  - `"rf"` → `parsnip::rand_forest(mtry = tune(), min_n = tune(), trees = 500)`
+    `|> set_engine("ranger") |> set_mode("classification")`
+  - `"glmnet"` → `parsnip::logistic_reg(penalty = tune(), mixture = tune())`
+    `|> set_engine("glmnet") |> set_mode("classification")`
 
-- [ ] Replace `run_ml_on_assay()` with `run_caret_on_assay(tse, assay_name, method, label_col, kfold, seed)`:
-  1. Extract feature matrix X (samples × features) and outcome y from the TSE assay
-  2. Stratified outer split via `caret::createDataPartition(y, p = 0.8)` with `set.seed(seed)`
-  3. `preProcess(train_X, method = c("nzv", "center", "scale"))` — fit on train only
-  4. Apply preProcess to both train and test X
-  5. `caret::train(x = train_X, y = y_train, method = ..., trControl = make_train_control(kfold))`
-  6. `predict()` on test_X; compute Accuracy, Kappa, AUC via `caret::confusionMatrix()` + `pROC::roc()`
-  7. Return a one-row tibble matching the current `r$performance` column layout
+- [ ] Add helper `metric_set_clf()` returning
+  `yardstick::metric_set(roc_auc, accuracy, kap)` (replaces the caret
+  AUC/confusionMatrix combo).
 
-- [ ] Replace `evaluate_binning()` with `evaluate_binning_caret(tse, n_bins_grid, method, label_col, kfold, seed)`:
-  1. Extract raw counts matrix and outcome y from TSE
-  2. Fixed outer split identical to above (`createDataPartition`, same seed)
-  3. n_bins tuning — inner CV loop on training samples only:
-     - `createFolds(y_train, k = kfold)` to create inner fold indices
-     - For each `nb` in `n_bins_grid`:
-       - For each inner fold:
-         - `fit_bin_breaks(train_mat[, -val_idx], nb)` ← fit on inner-train
-         - `apply_bin_breaks()` on inner-train and inner-val
-         - `preProcess()` on inner-train binned matrix, apply to inner-val
-         - `caret::train()` on inner-train; predict inner-val; record AUC
-       - Compute mean AUC across folds for this `nb`
-     - `best_n_bins = n_bins_grid[which.max(mean_aucs)]`
-  4. Final refit:
-     - `fit_bin_breaks(train_mat, best_n_bins)` ← full training set
-     - `apply_bin_breaks()` on training mat and test mat
-     - `preProcess()` on training binned mat, apply to test
-     - `caret::train()` on training set; evaluate on test set
-  5. Return the same tibble structure as `run_caret_on_assay()`, plus `tuning` trace
-     (mean_auc per n_bins candidate) and `best_n_bins`
+- [ ] Replace `run_ml_on_assay()` with
+  `run_tidymodels_on_assay(tse, assay_name, method, label_col, kfold, seed)`:
+  1. Build a tibble with outcome + features from the TSE assay.
+  2. `set.seed(seed)`; `split <- rsample::initial_split(df, prop = 0.8, strata = outcome)`.
+  3. Recipe: `recipe(outcome ~ ., data = training(split)) |> step_nzv(all_predictors()) |> step_normalize(all_predictors())`.
+  4. `wf <- workflow() |> add_recipe(rec) |> add_model(model_spec(method))`.
+  5. Inner CV: `folds <- rsample::vfold_cv(training(split), v = kfold, strata = outcome)`.
+  6. `tuned <- tune::tune_grid(wf, resamples = folds, grid = ..., metrics = metric_set_clf())`.
+  7. `best <- tune::select_best(tuned, metric = "roc_auc")`;
+     `final_wf <- tune::finalize_workflow(wf, best)`.
+  8. `final_fit <- tune::last_fit(final_wf, split = split, metrics = metric_set_clf())`.
+  9. Return `tune::collect_metrics(final_fit) |> tidyr::pivot_wider(...)` shaped
+     to match the existing column contract (`Accuracy`, `Kappa`, `AUC`).
 
-- [ ] Update `evaluate_transformation()` to call the new caret functions and
-  preserve the existing output column contract (`method`, `transformation`,
-  `selected_n_bins`, `Accuracy`, `Kappa`, plus `AUC` if not already present)
+- [ ] Replace `evaluate_binning()` with
+  `evaluate_binning_tidymodels(tse, n_bins_grid, method, label_col, kfold, seed)`:
+  1. Build a tibble with outcome + raw counts from the TSE.
+  2. Same outer split (`initial_split`, same seed).
+  3. Recipe prepends `step_quantile_bin(all_predictors(), n_bins = tune())`
+     before `step_nzv()` and `step_normalize()` — every other step is identical
+     to `run_tidymodels_on_assay()`.
+  4. Inner CV: `vfold_cv(training(split), v = kfold, strata = outcome)`.
+  5. Tuning grid combines `n_bins_grid` with the model's hyperparameters
+     (e.g. via `dials::grid_regular()` or an explicit `tidyr::crossing()`).
+     `tune_grid()` re-preps the recipe per fold automatically — no leakage.
+  6. `select_best(metric = "roc_auc")` → `finalize_workflow()` → `last_fit()`.
+  7. Return the same shaped row as `run_tidymodels_on_assay()`, plus a `tuning`
+     trace (`tune::collect_metrics(tuned, summarize = TRUE)` filtered to
+     `roc_auc`) and `best_n_bins` extracted from `best$n_bins`.
+
+- [ ] Update `evaluate_transformation()` to call the new tidymodels functions
+  and preserve the existing output column contract (`method`,
+  `transformation`, `selected_n_bins`, `Accuracy`, `Kappa`, plus `AUC` if
+  not already present).
 
 ### Phase 3 — Pipeline cleanup (_targets.R)
 
-- [ ] Update `tar_option_set(packages = ...)`: remove `mikropml`, add `caret`, `pROC`
+- [ ] Update `tar_option_set(packages = ...)`: remove `mikropml`, add
+  `tidymodels` (or the explicit set: `rsample`, `recipes`, `parsnip`,
+  `workflows`, `tune`, `yardstick`, `dials`)
 - [ ] Confirm `model_grid` branching and `map(model_grid)` pattern still work
   (no structural changes needed — only `evaluate_transformation()` internals change)
 - [ ] Invalidate the targets cache (`targets::tar_invalidate(everything())`) and do
@@ -134,9 +161,14 @@ Outer split (same fixed seed)
 
 - TSS, rCLR, and P/A are per-sample transforms (no cross-sample statistics), so
   pre-computing them in `add_all_transformations()` is fine and requires no change.
-- The `fit_bin_breaks` / `apply_bin_breaks` split mirrors the caret `preProcess` /
-  `predict.preProcess` pattern — fit an object on training data, apply it elsewhere.
+- The `fit_bin_breaks` / `apply_bin_breaks` split mirrors the recipes
+  `prep()` / `bake()` pattern — fit on training data, apply elsewhere — and
+  is what `step_quantile_bin()` wraps internally.
 - Keep the same outer-split seed (42) and 80/20 ratio so results are comparable
   to the mikropml baseline during the transition.
-- caret's `"ranger"` method tunes `mtry`, `splitrule`, and `min.node.size` in the
-  inner CV automatically; no changes needed to the classifier tuning grid.
+- For `rand_forest` with the `ranger` engine, parsnip exposes `mtry`, `min_n`,
+  and `trees` as tuning parameters; `splitrule` is fixed to `"gini"` for
+  classification and is not tuned.
+- `tune::last_fit()` is the tidymodels primitive for "refit on the training
+  split, evaluate once on the test split" — it takes the `rsample::initial_split`
+  object directly, so the outer split is reused without re-derivation.
