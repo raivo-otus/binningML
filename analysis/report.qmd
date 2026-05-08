@@ -54,21 +54,28 @@ poster_fig <- function(plot, name,
 
 tar_load(model_results)
 tar_load(tse_list_transformed)
+tar_load(min_class_n)
+tar_load(n_bins_levels)
+tar_load(n_bins_range)
+tar_load(cv_folds)
 
 dataset_meta <- purrr::imap_dfr(tse_list_transformed, function(tse, nm) {
   counts_mat <- SummarizedExperiment::assay(tse, "counts")
   cd         <- as.data.frame(SummarizedExperiment::colData(tse))
   tibble::tibble(
-    dataset  = nm,
-    sparsity = mean(counts_mat == 0),
-    seq_type = unique(cd$seq_type)[[1]],
-    disease  = unique(cd$disease)[[1]]
+    dataset    = nm,
+    n_samples  = ncol(counts_mat),
+    n_features = nrow(counts_mat),
+    sparsity   = mean(counts_mat == 0),
+    seq_type   = unique(cd$seq_type)[[1]],
+    disease    = if ("disease" %in% names(cd)) unique(cd$disease)[[1]] else NA_character_
   )
 })
 
-# Order transformations so binning sits next to the others for easy comparison
+# AUC is the primary metric (it is what inner-CV tuning optimises).
+# Accuracy and Kappa are secondary.
 trans_levels <- c("relabundance", "rclr", "pa", "binning")
-metric_cols  <- c("Accuracy", "Kappa")
+metric_cols  <- c("AUC", "Accuracy", "Kappa")
 
 results <- model_results |>
   mutate(
@@ -80,189 +87,349 @@ results_long <- results |>
   select(dataset, method, transformation, is_binning, all_of(metric_cols)) |>
   pivot_longer(all_of(metric_cols), names_to = "metric", values_to = "value") |>
   mutate(metric = factor(metric, levels = metric_cols))
-```
 
-# At-a-glance: does binning help?
-
-The plots below are designed to answer one question: **does the binning
-transformation deliver competitive test-set AUC compared to the standard
-transformations (relabundance, rCLR, presence/absence)?** Each panel slices
-the same `model_results` table from a different angle.
-
-## Classification metrics by transformation, per classifier
-
-Each point is one dataset. Boxplots summarise the spread across datasets.
-If binning works, its box should sit at or above the others on every metric.
-
-```{r fig-box-metrics, fig.height=8}
-poster_fig(
-  ggplot(results_long,
-         aes(x = transformation, y = value, fill = is_binning)) +
-    geom_boxplot(outlier.shape = NA, alpha = 0.6) +
-    geom_jitter(width = 0.15, height = 0, size = 1.2, alpha = 0.7) +
-    facet_grid(metric ~ method, scales = "free_y") +
-    scale_fill_npg(guide = "none") +
-    labs(x = NULL, y = "Metric value",
-         title = "Accuracy and Kappa across datasets") +
-    theme_minimal(base_size = 12) +
-    theme(axis.text.x = element_text(angle = 30, hjust = 1)),
-  name = "fig-box-metrics", width = 14, height = 10
+method_colors <- c(
+  rf      = "#457B9D",
+  glmnet  = "#BC4749",
+  svm_rbf = "#E9C46A"
 )
 ```
 
+# Dataset overview
+
+```{r callout-params, results="asis"}
+# Emit a callout block with the pipeline parameters.
+glue::glue("
+::: {{.callout-note title='Pipeline parameters'}}
+| Parameter | Value |
+|---|---|
+| Min samples per class (`min_class_n`) | {min_class_n} |
+| n_bins candidates (`n_bins_levels`) | {n_bins_levels} (log₂-spaced) |
+| n_bins range (`n_bins_range`) | {n_bins_range[1]}–{n_bins_range[2]} |
+| CV folds (inner & outer) | {cv_folds} |
+| Classifiers | Random Forest (`ranger`), Regularised logistic regression (`glmnet`), Radial SVM (`kernlab`) |
+| Transformations | relabundance, rCLR, presence/absence, quantile binning |
+| Tuning metric | ROC-AUC (inner CV) |
+:::
+")
+```
+
+```{r tbl-datasets}
+dataset_meta |>
+  count(seq_type, name = "n_datasets") |>
+  arrange(desc(n_datasets)) |>
+  knitr::kable(
+    col.names = c("Sequencing type", "Datasets"),
+    caption   = paste0(
+      "Datasets after filtering (min ", min_class_n,
+      " samples per class): n = ", nrow(dataset_meta)
+    )
+  )
+```
+
+# Preprocessing pipeline
+
+All datasets are agglomerated to genus level before any modelling. The table
+below summarises which recipe steps are applied to each classifier, followed by
+the rationale for each design decision.
+
+```{r tbl-preprocessing}
+tibble::tribble(
+  ~Step,                         ~RF,  ~`glmnet`,  ~`svm_rbf`,
+  "Genus-level agglomeration",   "✓",  "✓",        "✓",
+  "Feature transformation",      "✓",  "✓",        "✓",
+  "Zero-variance filter",        "✓",  "✓",        "✓",
+  "Z-score normalisation",       "—",  "✓",        "✓"
+) |>
+  knitr::kable(caption = "Recipe steps by classifier class")
+```
+
+## Genus-level agglomeration
+
+Raw count tables contain taxa resolved to varying depths. Agglomerating to
+genus level reduces dimensionality, smooths over uncertain species-level
+assignments, and gives each transformation a consistent feature space across
+datasets.
+
+## Feature transformations
+
+Four transformations of the genus-level count matrix are compared:
+
+- **Relative abundance (TSS)** — each sample divided by its library size.
+  Corrects for sequencing depth; produces compositional proportions in $[0,1]$.
+- **Robust centred log-ratio (rCLR)** — log-ratio of each count to the
+  geometric mean of non-zero counts in that sample (zeros are handled without a
+  pseudocount). Accounts for compositionality while preserving the zero structure.
+- **Presence/absence (PA)** — binary indicator of detection. Discards all
+  abundance information; useful when count magnitudes are unreliable or when
+  only occupancy patterns matter.
+- **Quantile binning** — non-zero counts within each sample are split into
+  $n_\text{bins}$ equal-frequency quantile groups; zeros map to bin 0. The
+  number of bins is a tunable hyperparameter selected by inner-CV AUC (see
+  Section\ \@ref(binning-internals)). Because breaks are computed sample-wise,
+  the transformation is leakage-free and can be applied inside the recipe.
+
+All transformations are sample-wise: no cross-sample statistics are computed,
+so they are safe to apply before the train/test split and inside inner CV folds
+without leakage.
+
+## Zero-variance filtering
+
+`step_zv()` drops any feature whose values are identical across all training
+samples in a given fold. This can occur after binning (many taxa collapse to
+all-zero bins) and occasionally with presence/absence on extremely prevalent or
+extremely rare taxa. Using exact zero-variance rather than the near-zero-variance
+heuristic (`step_nzv`) avoids silently discarding rare-but-present taxa whose
+low frequency ratios could still carry signal—a meaningful distinction in
+sparse microbiome data.
+
+## Z-score normalisation
+
+`step_normalize()` centres and scales each feature to mean 0, variance 1 on the
+training data of each fold. It is applied only to the three distance- or
+penalty-sensitive classifiers:
+
+**glmnet (elastic net):** The $L_1$ and $L_2$ penalties shrink coefficients
+toward zero. Without standardisation, features on a larger numerical scale
+receive a proportionally smaller effective penalty and are therefore
+systematically favoured, which confounds the regularisation path. Standardisation
+ensures that the penalty acts uniformly across features.
+
+**svm_rbf (radial SVM):** The RBF kernel $k(\mathbf{x}, \mathbf{x}') =
+\exp(-\sigma \|\mathbf{x} - \mathbf{x}'\|^2)$ measures Euclidean distance in
+feature space. Features with large variances dominate the distance calculation
+regardless of their biological relevance. Standardisation makes the kernel
+sensitive to the relative, not absolute, spread of each feature.
+
+::: {.callout-note title="Scaling ordinal bin labels"}
+When the binning transformation is combined with z-score normalisation, the
+recipe standardises ordinal integers (0, 1, 2, …, $n_\text{bins}$) rather than
+continuous abundances. Two properties of the binned representation make this
+well-behaved. First, the bins are **equally spaced** on an ordinal scale — each
+step from bin $k$ to $k+1$ represents the same rank increase — so treating the
+integers as a continuous scale is a reasonable approximation, and linear
+centering/scaling preserves that spacing. Second, zeros (absent taxa) remain
+distinguishable from bin 1 (lowest-abundance detected taxa) after scaling,
+because 0 is a structurally distinct value that maps to a standardised score
+well below the non-zero bin means. The practical consequence is that the
+penalty (glmnet) or distance kernel (svm_rbf) sees a feature space where
+each taxon's bin label has been placed on a common variance-1 scale — the same
+regularisation assumptions that justify normalising continuous features apply
+here.
+:::
+
+**Random Forest** does not receive normalisation. Decision trees split on
+individual feature thresholds; they are invariant to any monotone transformation
+of a feature's values, including centering and scaling. Adding normalisation to
+RF would be harmless but adds unnecessary computation.
+
+# Overall performance
+
+Three classifiers are compared across all transformation × dataset combinations.
+**Random Forest** (RF, `ranger`) is a bagging ensemble of decision trees; it handles
+high-dimensional, sparse count data well and requires minimal preprocessing.
+**Regularised logistic regression** (`glmnet`) fits an elastic-net penalised linear
+model; features are standardised before fitting.
+**Radial basis function SVM** (`kernlab`) uses an RBF kernel to separate classes in a
+high-dimensional feature space; it also requires standardised inputs.
+
+::: {.callout-note title="ROC-AUC" collapse="true"}
+Area under the receiver operating characteristic curve. Measures the probability
+that the model ranks a random case higher than a random control. Ranges from
+0.5 (random) to 1.0 (perfect). **Used as the inner-CV tuning metric** because it
+is threshold-independent and robust to class imbalance.
+:::
+
+::: {.callout-note title="Accuracy" collapse="true"}
+Proportion of samples correctly classified. Intuitive, but sensitive to class
+imbalance — a model that always predicts the majority class can score high without
+being useful.
+:::
+
+::: {.callout-note title="Cohen's κ (Kappa)" collapse="true"}
+Adjusts accuracy for the agreement expected by chance given the observed class
+frequencies. Values near 0 indicate chance-level performance; values near 1 indicate
+near-perfect discrimination. More informative than raw accuracy when classes are
+imbalanced.
+:::
+
+Each point below is one dataset. Boxplots summarise the spread across all datasets.
+AUC is shown first; Accuracy and Kappa follow in separate plots. Binning is
+highlighted; its box should sit at or above the alternatives if it is competitive.
+
+```{r fig-box-auc}
+box_theme <- function() {
+  list(
+    theme_minimal(base_size = 12),
+    theme(axis.text.x = element_text(angle = 30, hjust = 1))
+  )
+}
+
+poster_fig(
+  results_long |>
+    filter(metric == "AUC") |>
+    ggplot(aes(x = transformation, y = value, fill = is_binning)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.6) +
+    geom_jitter(aes(colour = method), width = 0.15, height = 0, size = 1.2, alpha = 0.8) +
+    facet_wrap(~ method, nrow = 1) +
+    scale_fill_npg(guide = "none") +
+    scale_color_manual(values = method_colors, guide = "none") +
+    labs(x = NULL, y = "AUC", title = "ROC-AUC across datasets") +
+    box_theme(),
+  name = "fig-box-auc", width = 14, height = 5
+)
+```
+
+```{r fig-box-accuracy}
+poster_fig(
+  results_long |>
+    filter(metric == "Accuracy") |>
+    ggplot(aes(x = transformation, y = value, fill = is_binning)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.6) +
+    geom_jitter(aes(colour = method), width = 0.15, height = 0, size = 1.2, alpha = 0.8) +
+    facet_wrap(~ method, nrow = 1) +
+    scale_fill_npg(guide = "none") +
+    scale_color_manual(values = method_colors, guide = "none") +
+    labs(x = NULL, y = "Accuracy", title = "Accuracy across datasets") +
+    box_theme(),
+  name = "fig-box-accuracy", width = 14, height = 5
+)
+```
+
+```{r fig-box-kappa}
+poster_fig(
+  results_long |>
+    filter(metric == "Kappa") |>
+    ggplot(aes(x = transformation, y = value, fill = is_binning)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.6) +
+    geom_jitter(aes(colour = method), width = 0.15, height = 0, size = 1.2, alpha = 0.8) +
+    facet_wrap(~ method, nrow = 1) +
+    scale_fill_npg(guide = "none") +
+    scale_color_manual(values = method_colors, guide = "none") +
+    labs(x = NULL, y = "Cohen's κ", title = "Kappa across datasets") +
+    box_theme(),
+  name = "fig-box-kappa", width = 14, height = 5
+)
+```
+
+# Binning vs. alternatives
+
 ## Per-dataset comparison: binning vs. best alternative
 
-For each dataset × classifier, we compute the gap between binning's AUC and
-the best non-binning transformation. Positive bars mean binning *wins* on
-that dataset; negative bars mean a standard transformation does better.
+For each dataset × classifier, we compute **Δ AUC = AUC(binning) − AUC(best standard
+transformation)**. Positive bars mean binning wins on that dataset; negative bars
+mean a standard transformation does better.
 
 ```{r fig-delta-auc, fig.height=6}
 delta <- results |>
-  select(dataset, method, transformation, Accuracy) |>
-  pivot_wider(names_from = transformation, values_from = Accuracy) |>
+  select(dataset, method, transformation, AUC) |>
+  pivot_wider(names_from = transformation, values_from = AUC) |>
   mutate(
     best_other = pmax(relabundance, rclr, pa, na.rm = TRUE),
     delta_auc  = binning - best_other
-  )
+  ) |>
+  group_by(dataset) |>
+  mutate(mean_delta = mean(delta_auc, na.rm = TRUE)) |>
+  ungroup() |>
+  mutate(dataset = forcats::fct_reorder(dataset, mean_delta))
 
 poster_fig(
-  ggplot(delta, aes(x = reorder(dataset, delta_auc), y = delta_auc,
+  ggplot(delta, aes(x = dataset, y = delta_auc,
                     fill = delta_auc > 0)) +
     geom_col() +
     geom_hline(yintercept = 0, linewidth = 0.3) +
     coord_flip() +
-    facet_wrap(~ method) +
-    scale_fill_npg(guide = "none") +
-    labs(x = NULL, y = "Accuracy(binning) − Accuracy(best other)",
+    facet_wrap(~ method, ncol = 2) +
+    scale_fill_manual(values = c("TRUE" = "#BC4749", "FALSE" = "#457B9D"), guide = "none") +
+    labs(x = NULL, y = "AUC(binning) − AUC(best standard)",
          title = "Where does binning beat the best alternative?") +
     theme_minimal(base_size = 12),
-  name = "fig-delta-auc", width = 14, height = 8
+  name = "fig-delta-auc", width = 14, height = 12
 )
 ```
 
 ## Head-to-head scatter
 
-Binning vs. each alternative, point-by-point. Points above the diagonal
+Binning AUC vs. each alternative, point-by-point. Points above the diagonal
 mean binning wins on that (dataset, classifier) pair.
 
 ```{r fig-scatter, fig.height=5}
 scatter <- results |>
-  select(dataset, method, transformation, Accuracy) |>
-  pivot_wider(names_from = transformation, values_from = Accuracy) |>
+  select(dataset, method, transformation, AUC) |>
+  pivot_wider(names_from = transformation, values_from = AUC) |>
   pivot_longer(c(relabundance, rclr, pa),
                names_to = "alternative", values_to = "alt_auc")
 
 poster_fig(
-  ggplot(scatter, aes(x = alt_auc, y = binning, colour = method)) +
+  ggplot(scatter, aes(x = alt_auc, y = binning)) +
     geom_abline(slope = 1, intercept = 0, linetype = "dashed",
                 colour = "grey50") +
-    geom_point(size = 2, alpha = 0.8) +
-    facet_wrap(~ alternative) +
-    scale_color_npg() +
+    geom_point(aes(colour = binning > alt_auc), size = 2, alpha = 0.8) +
+    facet_grid(method ~ alternative) +
     coord_equal() +
-    labs(x = "CV Accuracy (alternative transformation)",
-         y = "CV Accuracy (binning)",
+    scale_color_manual(values = c("TRUE" = "#457B9D", "FALSE" = "#BC4749"), guide = "none") +
+    labs(x = "AUC (alternative transformation)",
+         y = "AUC (binning)",
          title = "Binning vs. alternatives — points above the line favour binning") +
     theme_minimal(base_size = 12),
-  name = "fig-scatter", width = 14, height = 6
+  name = "fig-scatter", width = 12, height = 14
 )
 ```
+
+# Binning internals
 
 ## Selected `n_bins` distribution
 
 Which bin counts did the inner CV pick? A tight distribution suggests a
 sweet spot; a flat one suggests `n_bins` doesn't matter much.
 
-```{r fig-nbins, fig.height=4}
+```{r fig-nbins, fig.height=7}
 poster_fig(
   results |>
     filter(transformation == "binning") |>
     ggplot(aes(x = factor(selected_n_bins), fill = method)) +
-    geom_bar(position = "dodge") +
-    scale_fill_npg() +
+    geom_bar(alpha = 0.85) +
+    facet_wrap(~ method, ncol = 2) +
+    scale_fill_manual(values = method_colors, guide = "none") +
     labs(x = "Selected n_bins (inner-CV winner)",
          y = "Number of datasets",
          title = "Tuned n_bins across datasets") +
     theme_minimal(base_size = 12),
-  name = "fig-nbins", width = 10, height = 6
+  name = "fig-nbins", width = 10, height = 7
 )
 ```
 
-## Sparsity and binning advantage
 
-Does binning's edge grow with data sparsity? Each point is one dataset;
-delta is the difference between binning accuracy and the best standard
-transformation, averaged across the two classifiers.
-
-```{r fig-sparsity-delta, fig.height=5}
-sparsity_delta <- results |>
-  select(dataset, method, transformation, Accuracy) |>
-  mutate(transformation = as.character(transformation)) |>
-  pivot_wider(names_from = transformation, values_from = Accuracy) |>
-  mutate(
-    best_other = pmax(relabundance, rclr, pa, na.rm = TRUE),
-    delta_acc  = binning - best_other
-  ) |>
-  left_join(dataset_meta, by = "dataset")
-
-label_pts <- sparsity_delta |>
-  group_by(method) |>
-  slice_max(delta_acc, n = 3) |>
-  ungroup()
-
-poster_fig(
-  ggplot(sparsity_delta, aes(x = sparsity, y = delta_acc, colour = seq_type)) +
-    geom_hline(yintercept = 0, linetype = "dashed", colour = "grey60",
-               linewidth = 0.4) +
-    geom_smooth(aes(group = 1), method = "lm", se = TRUE,
-                colour = "grey35", fill = "grey80", linewidth = 0.7) +
-    geom_point(size = 2.5, alpha = 0.85) +
-    geom_text(data = label_pts,
-              aes(label = disease),
-              size = 2.8, nudge_y = 0.007, hjust = 0.5,
-              show.legend = FALSE) +
-    facet_wrap(~ method) +
-    scale_colour_npg() +
-    scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
-    labs(x = "Count-matrix sparsity (post-agglomeration)",
-         y = "Δ Accuracy (binning − best standard)",
-         colour = "Seq. type",
-         title = "Binning gains most in high-sparsity datasets") +
-    theme_minimal(base_size = 12),
-  name = "fig-sparsity-delta", width = 14, height = 7
-)
-```
-
-## Statistical comparison across transformations
+# Statistical comparison
 
 Friedman test (non-parametric repeated-measures) treats each dataset as a
-block and tests whether any transformation ranks consistently higher.
-Pairwise Wilcoxon signed-rank tests (Holm-adjusted) follow up on the
-omnibus result. Each cell shows the significance level and the mean accuracy
-difference (row − column); red cells favour the row transformation, blue
-cells favour the column transformation.
+block and tests whether any transformation ranks consistently higher by AUC.
+Pairwise Wilcoxon signed-rank tests (Holm-adjusted) follow up on the omnibus
+result. Each cell shows the significance level and the mean AUC difference
+(row − column); red cells favour the row transformation, blue cells favour
+the column transformation.
 
 ```{r stat-tests}
 trans_order <- c("relabundance", "rclr", "pa", "binning")
 pairs       <- combn(trans_order, 2, simplify = FALSE)
 
 test_wide <- model_results |>
-  select(dataset, method, transformation, Accuracy) |>
-  pivot_wider(names_from = transformation, values_from = Accuracy)
+  select(dataset, method, transformation, AUC) |>
+  pivot_wider(names_from = transformation, values_from = AUC)
 
-# Friedman test per method
+# Friedman test per classifier
 friedman_tbl <- model_results |>
-  select(dataset, method, transformation, Accuracy) |>
+  select(dataset, method, transformation, AUC) |>
   group_by(method) |>
   group_modify(~ {
-    ft <- friedman.test(Accuracy ~ transformation | dataset, data = .x)
+    ft <- friedman.test(AUC ~ transformation | dataset, data = .x)
     tibble::tibble(chi_sq  = round(ft$statistic, 2),
                    df      = ft$parameter,
                    p_value = ft$p.value)
   }) |>
   ungroup()
 
-# Pairwise Wilcoxon (Holm-adjusted within each method)
+# Pairwise Wilcoxon (Holm-adjusted within each classifier)
 pw_results <- test_wide |>
   group_by(method) |>
   group_modify(~ {
@@ -281,8 +448,8 @@ pw_results <- test_wide |>
 ```{r tbl-friedman}
 friedman_tbl |>
   knitr::kable(digits = c(0, 2, 0, 4),
-               col.names = c("Method", "χ²", "df", "p-value"),
-               caption   = "Friedman test: are transformation ranks non-random?")
+               col.names = c("Classifier", "χ²", "df", "p-value"),
+               caption   = "Friedman test: are transformation AUC ranks non-random?")
 ```
 
 ```{r fig-pw-wilcox, fig.height=5}
@@ -305,30 +472,51 @@ poster_fig(
   ggplot(pw_sym, aes(x = trans1, y = trans2, fill = mean_diff)) +
     geom_tile(colour = "white", linewidth = 0.6) +
     geom_text(aes(label = label), size = 3, lineheight = 0.9) +
-    facet_wrap(~ method) +
+    facet_wrap(~ method, ncol = 2) +
     scale_fill_gradient2(low  = "#4DBBD5FF",
                          mid  = "white",
                          high = "#E64B35FF",
                          midpoint = 0,
-                         name = "Mean Δ Acc\n(row − col)") +
+                         name = "Mean Δ AUC\n(row − col)") +
     labs(x = NULL, y = NULL,
          title   = "Pairwise Wilcoxon signed-rank tests (Holm-adjusted)",
-         caption = "Δ Acc = row transformation − column transformation") +
+         caption = "Δ AUC = row transformation − column transformation") +
     theme_minimal(base_size = 12) +
     theme(axis.text.x = element_text(angle = 30, hjust = 1),
           panel.grid  = element_blank()),
-  name = "fig-pw-wilcox", width = 12, height = 7
+  name = "fig-pw-wilcox", width = 14, height = 12
 )
 ```
 
-## Summary table
+# Summary table
+
+Mean [95% CI] for AUC, Accuracy, and Kappa per classifier × transformation across
+all datasets, sorted by mean AUC descending. CIs are t-based across datasets.
 
 ```{r tbl-summary}
+ci_fmt <- function(x) {
+  n  <- sum(!is.na(x))
+  mu <- mean(x, na.rm = TRUE)
+  se <- sd(x, na.rm = TRUE) / sqrt(n)
+  lo <- mu - qt(0.975, max(n - 1, 1)) * se
+  hi <- mu + qt(0.975, max(n - 1, 1)) * se
+  sprintf("%.3f [%.3f–%.3f]", mu, lo, hi)
+}
+
+auc_means <- results_long |>
+  filter(metric == "AUC") |>
+  group_by(method, transformation) |>
+  summarise(mean_auc = mean(value, na.rm = TRUE), .groups = "drop")
+
 results_long |>
   group_by(method, transformation, metric) |>
-  summarise(mean_value = mean(value, na.rm = TRUE), .groups = "drop") |>
-  pivot_wider(names_from = metric, values_from = mean_value) |>
-  arrange(method, desc(Accuracy)) |>
-  knitr::kable(digits = 3)
+  summarise(fmt = ci_fmt(value), .groups = "drop") |>
+  pivot_wider(names_from = metric, values_from = fmt) |>
+  left_join(auc_means, by = c("method", "transformation")) |>
+  arrange(method, desc(mean_auc)) |>
+  select(-mean_auc) |>
+  knitr::kable(
+    col.names = c("Classifier", "Transformation", "AUC", "Accuracy", "Kappa"),
+    caption   = "Mean [95% CI] across datasets (t-distribution, per classifier × transformation)"
+  )
 ```
-

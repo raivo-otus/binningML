@@ -8,32 +8,44 @@ tar_source("R/")
 # Pipeline-wide options
 tar_option_set(
   packages = c(
+    "dials",
     "dplyr",
     "ggsci",
     "ggplot2",
     "mia",
-    "mikropml",
-    "ranger",
+    "parsnip",
     "patchwork",
     "purrr",
-    "tidyr"
+    "kernlab",
+    "ranger",
+    "recipes",
+    "rlang",
+    "qs2",
+    "rsample",
+    "tibble",
+    "tidyr",
+    "tune",
+    "workflows",
+    "yardstick"
   ),
-  format = "rds",
-  # controller = crew_controller_local(workers = 4) # disable parallel for now
+  format = "qs",  # Faster then rds for object cache
+  controller = crew_controller_local(workers = 6)
 )
 
 # Global parameters — tweak here, everything downstream updates
 params <- list(
-  min_class_n  = 40L, # Minimum samples per class for a dataset to be included
-  n_bins_grid  = c(2, 3, 5, 8, 13, 21, 34, 55), # Bin count search grid
-  cv_folds     = 5L, # Folds for both outer and inner CV loops
+  min_class_n  = 50L,        # Minimum samples per class for a dataset to be included
+  n_bins_levels = 9L,        # Log2-spaced n_bins candidates
+  n_bins_range = c(1L, 50L), # Min and max n_bins explored during tuning
+  cv_folds     = 5L,         # Folds for both outer and inner CV loops
   random_seed  = 42L
 )
 
 list(
   # ── Parameters ────────────────────────────────────────────────────────────
   tar_target(min_class_n, params$min_class_n),
-  tar_target(n_bins_grid, params$n_bins_grid),
+  tar_target(n_bins_levels, params$n_bins_levels),
+  tar_target(n_bins_range, params$n_bins_range),
   tar_target(cv_folds, params$cv_folds),
   tar_target(random_seed, params$random_seed),
 
@@ -48,10 +60,11 @@ list(
 
   # ── Modeling ──────────────────────────────────────────────────────────────
   # Dynamic branching over the (dataset, transformation) grid. Each branch
-  # runs mikropml::run_ml; the binning branch additionally tunes n_bins.
+  # calls evaluate_transformation(); the binning branch tunes n_bins via
+  # inner CV (tune::tune_grid) so n_bins selection never sees the test set.
   tar_target(transformation_names,
              c("relabundance", "rclr", "pa", "binning")),
-  tar_target(classifier_names, c("rf", "glmnet")),
+  tar_target(classifier_names, c("rf", "glmnet", "svm_rbf")),
   tar_target(
     model_grid,
     tidyr::expand_grid(
@@ -66,7 +79,8 @@ list(
       tse            = tse_list_transformed[[model_grid$dataset_name]],
       transformation = model_grid$transformation,
       method         = model_grid$classifier,
-      n_bins_grid    = n_bins_grid,
+      n_bins_levels  = n_bins_levels,
+      n_bins_range   = n_bins_range,
       kfold          = cv_folds,
       seed           = random_seed
     ) |>
@@ -76,9 +90,6 @@ list(
 
 
   # ── Reporting ─────────────────────────────────────────────────────────────
-  tar_quarto(
-    report,
-    path = "analysis/report.qmd",
-    quiet = FALSE
-  )
+  tar_quarto(report, path = "analysis/report.qmd", quiet = FALSE)
+
 )
